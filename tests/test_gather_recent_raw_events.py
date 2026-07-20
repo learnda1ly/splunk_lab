@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -45,7 +47,6 @@ class ParseBucketNameTests(unittest.TestCase):
 
 class WindowOverlapTests(unittest.TestCase):
     def test_overlap_partial(self):
-        # Bucket spans before and into the window.
         self.assertTrue(mod.bucket_overlaps_window(100, 50, window_start=80, window_end=200))
 
     def test_fully_before_window(self):
@@ -114,7 +115,7 @@ class CollectBucketsTests(unittest.TestCase):
 
 
 class ExportCmdTests(unittest.TestCase):
-    def test_build_exporttool_cmd(self):
+    def test_build_exporttool_cmd_streams_stdout(self):
         bucket = mod.BucketInfo(
             path=Path("/opt/splunk/var/lib/splunk/main/db/db_1_0_1"),
             index_name="main",
@@ -127,7 +128,6 @@ class ExportCmdTests(unittest.TestCase):
         cmd = mod.build_exporttool_cmd(
             Path("/opt/splunk"),
             bucket,
-            Path("/tmp/out.csv"),
             earliest_epoch=100,
             latest_epoch=200,
         )
@@ -138,7 +138,7 @@ class ExportCmdTests(unittest.TestCase):
                 "cmd",
                 "exporttool",
                 "/opt/splunk/var/lib/splunk/main/db/db_1_0_1",
-                "/tmp/out.csv",
+                "/dev/stdout",
                 "-csv",
                 "-et",
                 "100",
@@ -146,6 +146,47 @@ class ExportCmdTests(unittest.TestCase):
                 "200",
             ],
         )
+
+
+class RawOnlyGzipTests(unittest.TestCase):
+    SAMPLE_CSV = (
+        '"_time",source,host,sourcetype,"_raw","_meta"\n'
+        '1700001234,"source::/var/log/app.log","host::idx1","sourcetype::app:json",'
+        '"{""level"":""info"",""msg"":""login ok""}","_indextime::1700001235"\n'
+        '1700001240,"source::WinEventLog:Security","host::dc01","sourcetype::WinEventLog:Security",'
+        '"line1\nline2","_indextime::1700001241"\n'
+    )
+
+    def test_iter_raw_strips_all_metadata(self):
+        events = list(
+            mod.iter_raw_events_from_exporttool_csv(io.StringIO(self.SAMPLE_CSV))
+        )
+        self.assertEqual(
+            events,
+            [
+                '{"level":"info","msg":"login ok"}',
+                "line1\nline2",
+            ],
+        )
+        joined = "\n".join(events)
+        self.assertNotIn("_indextime", joined)
+        self.assertNotIn("sourcetype::", joined)
+        self.assertNotIn("host::", joined)
+
+    def test_write_raw_events_gzip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "bucket.raw.gz"
+            count = mod.write_raw_events_gzip(
+                out,
+                ['{"level":"info"}', "plain log line"],
+            )
+            self.assertEqual(count, 2)
+            with gzip.open(out, "rt", encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertEqual(text, '{"level":"info"}\nplain log line\n')
+            # No CSV header or metadata keys in the compressed payload.
+            self.assertNotIn("_time", text)
+            self.assertNotIn("_meta", text)
 
 
 if __name__ == "__main__":

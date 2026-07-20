@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Gather raw events from a Splunk indexer for specific indexes and recent buckets.
+Gather raw log events from a Splunk indexer for specific indexes and recent buckets.
 
 Designed to run on each peer in an indexer cluster. It discovers warm/cold
 buckets for the given indexes, keeps only originating copies (db_*), skips
 replicated copies (rb_*) and hot buckets, filters to buckets newer than N days,
-and extracts raw events via `splunk cmd exporttool`.
+and extracts events via `splunk cmd exporttool`.
+
+Output is intentionally metadata-free: only each event's original `_raw` text,
+written to per-bucket gzip files (*.raw.gz). exporttool's CSV columns
+(_time, source, host, sourcetype, _meta) are discarded after extraction.
 
 Why not coldToFrozenScript?
 ---------------------------
@@ -15,9 +19,8 @@ lifecycle stage from "buckets newer than 7 days". Those examples are still
 useful as documentation of bucket layout (rawdata/journal.gz) and of the rule
 that, in a cluster, each peer freezes its own copies — so archival scripts must
 avoid double-archiving replicas. For recent searchable buckets, exporttool is
-the right tool: it reads a complete hot/warm/cold bucket and emits original
-raw events plus metadata. Frozen archives that only keep journal.gz cannot be
-exported until thawed/rebuilt.
+the right decode path; we then keep only `_raw`. Copying journal.gz alone would
+be compressed but Splunk-proprietary, not plain log lines.
 
 Tarball packaging / remote move is intentionally left for a later step.
 """
@@ -25,6 +28,8 @@ Tarball packaging / remote move is intentionally left for a later step.
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import json
 import logging
 import os
@@ -34,13 +39,15 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, Iterator, List, Optional, Sequence, TextIO
 
 # Warm/cold originating: db_<newest>_<oldest>_<localid>[_<guid>]
 # Warm/cold replicated:  rb_<newest>_<oldest>_<localid>_<guid>
 BUCKET_NAME_RE = re.compile(
     r"^(?P<prefix>db|rb)_(?P<newest>\d+)_(?P<oldest>\d+)_(?P<rest>.+)$"
 )
+
+RAW_FIELD_CANDIDATES = ("_raw", "raw")
 
 
 @dataclass(frozen=True)
@@ -198,17 +205,17 @@ def collect_buckets(
 def build_exporttool_cmd(
     splunk_home: Path,
     bucket: BucketInfo,
-    output_file: Path,
     *,
     earliest_epoch: Optional[int] = None,
     latest_epoch: Optional[int] = None,
 ) -> List[str]:
+    """Build exporttool command that streams CSV to stdout for post-processing."""
     cmd = [
         str(splunk_home / "bin" / "splunk"),
         "cmd",
         "exporttool",
         str(bucket.path),
-        str(output_file),
+        "/dev/stdout",
         "-csv",
     ]
     if earliest_epoch is not None:
@@ -218,7 +225,98 @@ def build_exporttool_cmd(
     return cmd
 
 
-def export_bucket(
+def _looks_like_leading_noise(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if "log-cmdline.cfg" in stripped:
+        return True
+    # Real CSV header always names the _raw column.
+    if "_raw" not in stripped:
+        return True
+    return False
+
+
+class _SkipLeadingNoise:
+    """Line iterator that drops exporttool chatter before the CSV header."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._started = False
+
+    def __iter__(self) -> "_SkipLeadingNoise":
+        return self
+
+    def __next__(self) -> str:
+        while True:
+            line = next(self._stream)
+            if not self._started:
+                if _looks_like_leading_noise(line):
+                    continue
+                self._started = True
+            return line
+
+
+def iter_raw_events_from_exporttool_csv(stream: TextIO) -> Iterator[str]:
+    """
+    Yield only `_raw` values from an exporttool CSV stream.
+
+    Discards _time, source, host, sourcetype, and _meta. Skips exporttool noise
+    lines that sometimes appear before the real CSV header. Streams row-by-row
+    so large buckets are not buffered entirely in memory.
+    """
+    reader = csv.DictReader(_SkipLeadingNoise(stream))
+    if not reader.fieldnames:
+        return
+
+    raw_key = None
+    for candidate in RAW_FIELD_CANDIDATES:
+        if candidate in reader.fieldnames:
+            raw_key = candidate
+            break
+    if raw_key is None:
+        for name in reader.fieldnames:
+            if name.strip('"') == "_raw":
+                raw_key = name
+                break
+    if raw_key is None:
+        raise RuntimeError(
+            f"exporttool CSV missing _raw column; fields={reader.fieldnames!r}"
+        )
+
+    for row in reader:
+        raw = row.get(raw_key)
+        if raw is None:
+            continue
+        yield raw
+
+
+def write_raw_events_gzip(
+    output_file: Path,
+    raw_events: Iterable[str],
+    *,
+    compresslevel: int = 6,
+) -> int:
+    """
+    Write raw event texts to a gzip file.
+
+    Each event is written exactly as stored in `_raw`. If an event does not
+    already end with a newline, one is appended so consecutive events stay
+    separated for typical single-line logs. Multiline `_raw` values keep their
+    internal newlines (they are not one-line-per-event files in that case).
+    """
+    count = 0
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(output_file, "wt", encoding="utf-8", compresslevel=compresslevel) as out:
+        for raw in raw_events:
+            out.write(raw)
+            if not raw.endswith("\n"):
+                out.write("\n")
+            count += 1
+    return count
+
+
+def export_bucket_raw_gzip(
     splunk_home: Path,
     bucket: BucketInfo,
     output_dir: Path,
@@ -226,29 +324,51 @@ def export_bucket(
     earliest_epoch: Optional[int] = None,
     latest_epoch: Optional[int] = None,
     dry_run: bool = False,
+    compresslevel: int = 6,
 ) -> Path:
     index_out = output_dir / bucket.index_name
-    index_out.mkdir(parents=True, exist_ok=True)
-    output_file = index_out / f"{bucket.name}.csv"
+    output_file = index_out / f"{bucket.name}.raw.gz"
     cmd = build_exporttool_cmd(
         splunk_home,
         bucket,
-        output_file,
         earliest_epoch=earliest_epoch,
         latest_epoch=latest_epoch,
     )
-    logging.info("Export: %s", " ".join(cmd))
+    logging.info(
+        "Export raw→gzip: %s  →  %s",
+        " ".join(cmd),
+        output_file,
+    )
     if dry_run:
         return output_file
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"exporttool failed for {bucket.path} (rc={result.returncode}): {stderr}"
+    index_out.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert process.stdout is not None
+    try:
+        count = write_raw_events_gzip(
+            output_file,
+            iter_raw_events_from_exporttool_csv(process.stdout),
+            compresslevel=compresslevel,
         )
-    if not output_file.is_file():
-        raise RuntimeError(f"exporttool reported success but no file at {output_file}")
+    finally:
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        rc = process.wait()
+
+    if rc != 0:
+        if output_file.exists():
+            output_file.unlink()
+        raise RuntimeError(
+            f"exporttool failed for {bucket.path} (rc={rc}): {stderr.strip()}"
+        )
+    logging.info("Wrote %d raw event(s) to %s", count, output_file)
     return output_file
 
 
@@ -263,8 +383,13 @@ def write_manifest(path: Path, buckets: Sequence[BucketInfo], exports: Sequence[
         "bucket_count": len(buckets),
         "buckets": bucket_rows,
         "exports": [str(p) for p in exports],
+        "format": {
+            "type": "raw_gzip",
+            "extension": ".raw.gz",
+            "contents": "Only original _raw event text; no Splunk metadata fields.",
+        },
         "notes": {
-            "tarball": "Not implemented yet; outputs are per-bucket CSV from exporttool.",
+            "tarball": "Not implemented yet; outputs are per-bucket .raw.gz files.",
             "cluster": (
                 "Run on every peer. By default only originating db_* buckets are "
                 "exported so replicated rb_* copies are not duplicated."
@@ -288,8 +413,8 @@ def resolve_splunk_paths(splunk_home: Path) -> tuple[Path, Path]:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Gather raw events from recent Splunk indexer buckets for specific "
-            "indexes (indexer-cluster aware)."
+            "Gather raw log events (no metadata) from recent Splunk indexer "
+            "buckets for specific indexes; write compressed .raw.gz files."
         )
     )
     parser.add_argument(
@@ -311,7 +436,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="./raw_event_exports",
-        help="Directory for per-bucket CSV exports and manifest (default: ./raw_event_exports).",
+        help="Directory for per-bucket .raw.gz exports and manifest.",
+    )
+    parser.add_argument(
+        "--compresslevel",
+        type=int,
+        default=6,
+        choices=range(1, 10),
+        metavar="{1-9}",
+        help="gzip compression level 1-9 (default: 6).",
     )
     parser.add_argument(
         "--include-replicated",
@@ -334,7 +467,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="List matching buckets and planned exporttool commands; do not export.",
+        help="List matching buckets and planned exports; do not write files.",
     )
     parser.add_argument(
         "--verbose",
@@ -368,6 +501,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.max_age_days,
         window_start,
     )
+    logging.info("Output format: raw events only (.raw.gz); metadata discarded")
 
     if not splunk_db.is_dir():
         logging.error("SPLUNK_DB does not exist: %s", splunk_db)
@@ -399,13 +533,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for bucket in buckets:
         try:
             exports.append(
-                export_bucket(
+                export_bucket_raw_gzip(
                     splunk_home,
                     bucket,
                     output_dir,
                     earliest_epoch=earliest,
                     latest_epoch=latest,
                     dry_run=args.dry_run,
+                    compresslevel=args.compresslevel,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - continue other buckets
@@ -419,10 +554,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         logging.info("Dry-run complete; no files written.")
 
-    # Placeholder for future packaging step (tarball / transfer).
     logging.info(
         "Packaging/move step not implemented yet "
-        "(next: tar CSV/raw outputs for off-box transfer)."
+        "(next: tar .raw.gz outputs for off-box transfer)."
     )
 
     if failures:
